@@ -61,7 +61,7 @@ getSynthMEs(
 
 * `minimumMEmembers` (int, default 4): Minimum markers per module to compute a synthetic ME in target
 * `topPercent` (0–1, default 0.20): Start with top X% kME members from template module
-* `minKmeThreshToRescue` (0–1, default 0.70): If topPercent yields too few markers, **rescue** by taking all members with kME ? this threshold
+* `minKmeThreshToRescue` (0–1, default 0.70): If topPercent yields too few markers, **rescue** by taking all members with kME >= this threshold
 * `cleanDat.template` (matrix/df): Template expression (rows=features, cols=samples)
 * `netColors.template` (vector): Template module colors; length = `nrow(cleanDat.template)`
 * `cleanDat.target` (matrix/df): Target expression (rows=features, cols=samples)
@@ -192,7 +192,7 @@ kMEcleanup(
 * `MEs` (matrix/df): eigengenes (rows = samples, cols = modules). Column names may be `"ME<color>"` or `"<color>"`. A `grey` column (if present) is dropped internally for kME calculations
 * `NETcolors` (named character vector, optional): starting color per **row** of `cleanDat`. If **missing**, it is **derived** from `synthMEmembersCSV`
 * `synthMEmembersCSV` (string, optional): if `NETcolors` missing, CSV with **one column per color** and rows listing member assay IDs (rownames in `cleanDat`) used to build each synthetic ME
-* `kMEmaxDiff` (default 0.10): if (kME.max ? kME.intra) ? this value ? **reassign** to module of kME.max
+* `kMEmaxDiff` (default 0.10): if (kME.max - kME.intra) >= this value -> **reassign** to module of kME.max
 * `reassignIfGT` (default 0.30): **grey** features with kME.max > threshold are reassigned to the kME.max module
 * `greyIfLT` (default 0.30): features with **intra-module kME < threshold** are set to **grey**
 * `keepColors` (logical, default **TRUE**): if TRUE, **preserve color identities** and protect **rolling hubs**
@@ -204,13 +204,13 @@ kMEcleanup(
 1. **Optionally enforce** last iteration’s hubs (when `keepColors=TRUE`)
 2. Grey out low intra-module kME (< `greyIfLT`)
 3. Reassign from grey to max-kME color if kME.max > `reassignIfGT`
-4. Reassign non-grey rows to their max-kME color if (kME.max ? kME.intra) ? `kMEmaxDiff`
+4. Reassign non-grey rows to their max-kME color if (kME.max - kME.intra) >= `kMEmaxDiff`
 5. **Recompute** eigengenes and kME on the updated colors (messages suppressed)
 6. **Update** rolling hubs (if `keepColors=TRUE`)
 7. **Converge** when:
 
-   * All **non-grey**, **non-hub** rows have intra-module kME ? `greyIfLT` **and**
-   * Their (kME.max ? kME.intra) ? `kMEmaxDiff`
+   * All **non-grey**, **non-hub** rows have intra-module kME ≥ `greyIfLT` **and**
+   * Their (kME.max - kME.intra) ≤ `kMEmaxDiff`
      (Hubs are intentionally excluded from the criteria when `keepColors=TRUE`.)
 
 Hard stop after **30 iterations** with a warning.
