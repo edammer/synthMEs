@@ -53,7 +53,8 @@ getSynthMEs(
   cleanDat.template,
   netColors.template,
   cleanDat.target,
-  matchCSV = "Synthetic_eigengene_exact_match_members.csv"
+  matchCSV = "Synthetic_eigengene_exact_match_members.csv",
+  kMEdat = NULL
 )
 ```
 
@@ -66,6 +67,9 @@ getSynthMEs(
 * `netColors.template` (vector): Template module colors; length = `nrow(cleanDat.template)`
 * `cleanDat.target` (matrix/df): Target expression (rows=features, cols=samples)
 * `matchCSV` (string): CSV filename to write **per-module feature members** actually used in the synthetic ME computation
+* `kMEdat` (matrix/df): Optional input of precalculated ME (column) correlations (bicor preferred) for all features (rows) in a template network
+           if provided, other .template inputs are ignored and need not be provided; it is best to include unique feature names
+           and at least one column with colors (module assignments) for all features
 
 ### Returns
 
