@@ -11,29 +11,61 @@
 #' @param cleanDat.target matrix/data.frame of target expression (rows = features, cols = samples)
 #' @param matchCSV output CSV file name for matched markers (default
 #'        "Synthetic_eigengene_exact_match_members.csv")
+#' @param kMEdat a data frame of correlations precomputed to color-named module eigengenes;
+#'        may include a column of valid R colors for module assignments (in lieu of netColors.template) and either rownames or another column
+#'        of feature names that are not (all) valid R colors. If no color vector for feature assignments in included, the ME (column) for a feature (row) with max kME
+#'        and kME at least 0.35 is considered the assigned module for that feature (default NULL; use cleanDat.template and netColors.template instead)
 #' @return data.frame of synthetic MEs for the target cohort
 
 getSynthMEs <- function(
-  minimumMEmembers = 4,
-  topPercent        = 0.20,
+  minimumMEmembers     = 4,
+  topPercent           = 0.20,
   minKmeThreshToRescue = 0.70,
-  cleanDat.template,
-  netColors.template,
+  cleanDat.template    = NULL,
+  netColors.template   = NULL,
   cleanDat.target,
-  matchCSV = "Synthetic_eigengene_exact_match_members.csv"
+  matchCSV             = "Synthetic_eigengene_exact_match_members.csv",
+  kMEdat               = NULL           # optional: precomputed kME table
 ) {
-  # --- Basic checks -----------------------------------------------------------
+
+  ## --- helpers ----------------------------------------------------------------
+  ## "kMEblue", "MEblue", "kMEMEblue" -> "blue"
+  stripME <- function(x) sub("^(kME|ME)+", "", x)
+
+  ## "kMEturquoise|M1" -> "turquoise";  used for kMEdat column names
+  simplifyModName <- function(x) {
+    stripME(vapply(strsplit(as.character(x), "[|]"), function(z) z[1], character(1)))
+  }
+
+  ## split a candidate assignment column on "|" and keep the leading token;
+  colorTokens <- function(lastColVec) {
+    lastColVec <- as.character(lastColVec)
+    out <- tryCatch(
+      suppressWarnings(
+        as.data.frame(do.call("rbind", strsplit(lastColVec, "[|]")), stringsAsFactors = FALSE)[, 1]
+      ),
+      error = function(e) NULL
+    )
+    # then split on " ", and keep the second token; grabs the color from strings like "M1 turquoise|0.7001", but straight colors will also be retained.
+    out <- gsub("^M\\d+\\s","",out)
+    if (is.null(out)) NULL else as.character(out)
+  }
+
+  ## TRUE when every entry resolves to a valid R color name
+  allValidColors <- function(x, n) {
+    !is.null(x) && length(x) == n && !anyNA(x) && all(x %in% grDevices::colors())
+  }
+
+  ## --- basic checks -----------------------------------------------------------
   if (!requireNamespace("WGCNA", quietly = TRUE)) {
     stop("Package 'WGCNA' is required. Please install/load it.")
-  }
-  if (!is.matrix(cleanDat.template) && !is.data.frame(cleanDat.template)) {
-    stop("cleanDat.template must be a matrix or data.frame with rows=features, cols=samples.")
   }
   if (!is.matrix(cleanDat.target) && !is.data.frame(cleanDat.target)) {
     stop("cleanDat.target must be a matrix or data.frame with rows=features, cols=samples.")
   }
-  if (length(netColors.template) != nrow(cleanDat.template)) {
-    stop("Length of netColors.template must equal nrow(cleanDat.template).")
+  cleanDat.target <- as.matrix(cleanDat.target)
+  if (is.null(rownames(cleanDat.target))) {
+    stop("cleanDat.target must have rownames (feature / gene product identifiers).")
   }
   if (topPercent <= 0 || topPercent > 1) {
     stop("topPercent must be in (0,1].")
@@ -42,132 +74,314 @@ getSynthMEs <- function(
     stop("minimumMEmembers must be >= 1.")
   }
 
-  # Coerce to matrix to avoid data.frame pitfalls
-  cleanDat.template <- as.matrix(cleanDat.template)
-  cleanDat.target   <- as.matrix(cleanDat.target)
-
-  # --- Template MEs (consensus cohort) ---------------------------------------
-  MEList <- WGCNA::moduleEigengenes(t(cleanDat.template), colors = netColors.template)
-  MEs.template <- WGCNA::orderMEs(MEList$eigengenes)                # has "ME" prefix
-  rownames(MEs.template) <- colnames(cleanDat.template)              # samples as rows
-
-  # Drop grey from template ME sets for downstream matching
-  keepCols         <- setdiff(colnames(MEs.template), "MEgrey")
-  MEs.template.nog <- MEs.template[, keepCols, drop = FALSE]
-
-  # Prepare ME matrix (with/without "ME" prefix) for kME calculation
-  tmpMEs <- MEs.template
-  # ensure 'MEgrey' removed in the prefixed version as well
-  tmpMEs <- tmpMEs[, keepCols, drop = FALSE]
-
-  # --- kME in the template to rank members within each module -----------------
-  kMEdat <- WGCNA::signedKME(t(cleanDat.template), tmpMEs, corFnc = "bicor")
-
-  # --- Build overlap lists of target features per module ----------------------
+  useKME        <- !is.null(kMEdat)
   targetSymbols <- rownames(cleanDat.target)
-  allColors     <- unique(netColors.template)
-  colorlist     <- setdiff(allColors, "grey")
 
-  # For each module color: rank members by kME, take top topPercent (or rescue by threshold),
-  # then intersect with target features; keep only if >= minimumMEmembers.
-  thismod <- thismodTop <- overlap <- vector("list", length(colorlist))
-  names(thismod) <- names(thismodTop) <- names(overlap) <- colorlist
+  ## ===========================================================================
+  ## Template definition: either from supplied kMEdat, or computed as before
+  ## ===========================================================================
+  if (useKME) {
+
+    ## Minimum kME required to call a feature a member of its top module when
+    ## assignments have to be inferred from the kME table itself. Fixed, by design.
+    minKmeForAssignment <- 0.35
+
+    if (!is.null(cleanDat.template) || !is.null(netColors.template)) {
+      message("kMEdat supplied: cleanDat.template / netColors.template are ignored.")
+    }
+
+    ## -- coercible to data.frame? --------------------------------------------
+    kMEdf <- tryCatch(
+      as.data.frame(kMEdat, stringsAsFactors = FALSE),
+      error = function(e)
+        stop("kMEdat could not be coerced to a data.frame: ", conditionMessage(e))
+    )
+    if (nrow(kMEdf) < 1L || ncol(kMEdf) < 1L) stop("kMEdat is empty.")
+
+    ## -- column(s) of module color assignments? -------------------------------
+    ## Every non-numeric column is tested; entries may be "turquoise" or
+    ## "turquoise|M1". The FIRST column whose leading tokens are all valid R
+    ## colors becomes netColors.template; it and every other column that also
+    ## passed the test are removed from kMEdat.
+    netColors.template <- NULL
+    colorCols <- integer(0)
+
+    for (j in which(!vapply(kMEdf, is.numeric, logical(1)))) {
+      checkColors.vec <- colorTokens(kMEdf[[j]])
+      if (allValidColors(checkColors.vec, nrow(kMEdf))) {
+        colorCols <- c(colorCols, j)
+        if (is.null(netColors.template)) netColors.template <- checkColors.vec
+      }
+    }
+
+    if (length(colorCols) > 0L) {
+      message("kMEdat: column '", names(kMEdf)[colorCols[1]],
+              "' recognized as module color assignments (",
+              length(unique(netColors.template)), " unique colors); used as netColors.template.")
+      if (length(colorCols) > 1L) {
+        message("kMEdat: also dropped ", length(colorCols) - 1L,
+                " further color-valued column(s): ",
+                paste(names(kMEdf)[colorCols[-1]], collapse = ", "))
+      }
+      kMEdf <- kMEdf[, -colorCols, drop = FALSE]
+      if (ncol(kMEdf) < 1L) {
+        stop("kMEdat has no kME columns left after removing the color assignment column(s).")
+      }
+    }
+
+    ## -- rownames: rescue a single symbol column if rownames are 1..n ---------
+    rn           <- rownames(kMEdf)
+    looksDefault <- is.null(rn) || identical(rn, as.character(seq_len(nrow(kMEdf))))
+    isNum        <- vapply(kMEdf, is.numeric, logical(1))
+    if (looksDefault) {
+      if (sum(!isNum) == 1L) {
+        symCol  <- which(!isNum)
+        symName <- names(kMEdf)[symCol]
+        rownames(kMEdf) <- as.character(kMEdf[[symCol]])
+        kMEdf   <- kMEdf[, -symCol, drop = FALSE]
+        isNum   <- vapply(kMEdf, is.numeric, logical(1))
+        message("kMEdat: used column '", symName, "' as feature rownames.")
+      } else {
+        stop("kMEdat must have rownames holding feature identifiers ",
+             "(or a single non-numeric column of identifiers).")
+      }
+    }
+    if (ncol(kMEdf) < 1L) stop("kMEdat has no numeric kME columns.")
+    if (!all(isNum)) {
+      stop("kMEdat must contain only numeric kME columns; non-numeric: ",
+           paste(names(kMEdf)[!isNum], collapse = ", "), ".")
+    }
+
+    kMEmat <- as.matrix(kMEdf)
+    if (all(is.na(kMEmat))) stop("kMEdat contains no non-missing values.")
+
+    ## -- values must be correlations ------------------------------------------
+    rng <- range(kMEmat, na.rm = TRUE)
+    if (rng[1] < -1 - 1e-8 || rng[2] > 1 + 1e-8) {
+      stop(sprintf("kMEdat values must be eigenprotein correlations in [-1, +1]; observed range %.4f to %.4f.",
+                   rng[1], rng[2]))
+    }
+
+    ## -- de-duplicate features -------------------------------------------------
+    dupRow <- duplicated(rownames(kMEmat))
+    if (any(dupRow)) {
+      message("kMEdat: dropped ", sum(dupRow), " duplicated feature rowname(s); first occurrence kept.")
+      kMEmat <- kMEmat[!dupRow, , drop = FALSE]
+      if (!is.null(netColors.template)) netColors.template <- netColors.template[!dupRow]
+    }
+
+    ## -- normalize module column names, drop grey ------------------------------
+    rawModNames      <- colnames(kMEmat)
+    colnames(kMEmat) <- simplifyModName(rawModNames)
+
+    badMod <- which(!colnames(kMEmat) %in% grDevices::colors())
+    if (length(badMod) > 0L) {
+      stop("All kMEdat column names must simplify to valid R color names; these do not: ",
+           paste(sprintf("'%s' -> '%s'", rawModNames[badMod], colnames(kMEmat)[badMod]),
+                 collapse = ", "), ".")
+    }
+
+    if (anyDuplicated(colnames(kMEmat))) {
+      stop("kMEdat has duplicated module columns after stripping 'kME'/'ME' prefixes: ",
+           paste(unique(colnames(kMEmat)[duplicated(colnames(kMEmat))]), collapse = ", "), ".")
+    }
+    allModCols <- colnames(kMEmat)                 # module columns incl. grey
+    keepMods   <- setdiff(allModCols, c("grey", "Grey", "GREY"))
+    if (length(keepMods) == 0L) stop("kMEdat contains no non-grey module columns.")
+    kMEmat <- kMEmat[, keepMods, drop = FALSE]
+
+    ## -- rownames must at least partially match the target ---------------------
+    nMatch <- length(intersect(rownames(kMEmat), targetSymbols))
+    if (nMatch == 0L) {
+      stop("No kMEdat rownames match rownames(cleanDat.target). ",
+           "Check identifier format (e.g. 'SYMBOL|UNIPROT' vs 'SYMBOL').")
+    }
+    message(sprintf("kMEdat: %d features x %d modules; %d (%.1f%%) feature rownames match cleanDat.target.",
+                    nrow(kMEmat), ncol(kMEmat), nMatch, 100 * nMatch / nrow(kMEmat)))
+    if (nMatch < minimumMEmembers) {
+      warning("Only ", nMatch, " kMEdat feature(s) are present in cleanDat.target; ",
+              "fewer than minimumMEmembers (", minimumMEmembers, ").")
+    }
+
+    ## -- module assignment ------------------------------------------------------
+    if (!is.null(netColors.template)) {
+
+      ## from the supplied color assignment column
+      netColors <- as.character(netColors.template)
+
+    } else {
+
+      ## inferred: each feature to its maximum-kME module, if that max is high enough
+      kmeFill <- kMEmat
+      kmeFill[is.na(kmeFill)] <- -Inf
+      bestIdx <- max.col(kmeFill, ties.method = "first")
+      bestVal <- kmeFill[cbind(seq_len(nrow(kmeFill)), bestIdx)]
+
+      netColors  <- colnames(kMEmat)[bestIdx]
+      unassigned <- !is.finite(bestVal) | bestVal < minKmeForAssignment
+      netColors[unassigned] <- "grey"
+      message("kMEdat: no color assignment column found; assigned by maximum kME (>= ",
+              minKmeForAssignment, ").")
+      if (any(unassigned)) {
+        message("kMEdat: ", sum(unassigned), " feature(s) left unassigned (max kME < ",
+                minKmeForAssignment, ") and treated as grey.")
+      }
+    }
+
+    ## -- every assigned color must have a kME column in kMEdat -----------------
+    ## ('grey' is always allowed: it marks unassigned features.)
+    noKME <- setdiff(unique(netColors), c(allModCols, "grey", "Grey", "GREY"))
+    if (length(noKME) > 0L) {
+      stop("These module color assignments have no matching kMEdat column: ",
+           paste(noKME, collapse = ", "),
+           ".\n  kMEdat module columns: ", paste(allModCols, collapse = ", "), ".")
+    }
+
+    featureNames    <- rownames(kMEmat)
+    colorlist       <- keepMods                    # template order as given
+    templateMEnames <- paste0("ME", colorlist)
+    templateDim     <- NULL
+
+  } else {
+
+    ## -- original path: derive MEs and kME from the template cohort ------------
+    if (is.null(cleanDat.template) || is.null(netColors.template)) {
+      stop("Supply either kMEdat, or both cleanDat.template and netColors.template.")
+    }
+    if (!is.matrix(cleanDat.template) && !is.data.frame(cleanDat.template)) {
+      stop("cleanDat.template must be a matrix or data.frame with rows=features, cols=samples.")
+    }
+    if (length(netColors.template) != nrow(cleanDat.template)) {
+      stop("Length of netColors.template must equal nrow(cleanDat.template).")
+    }
+    cleanDat.template <- as.matrix(cleanDat.template)
+
+    MEList       <- WGCNA::moduleEigengenes(t(cleanDat.template), colors = netColors.template)
+    MEs.template <- WGCNA::orderMEs(MEList$eigengenes)          # has "ME" prefix
+    rownames(MEs.template) <- colnames(cleanDat.template)       # samples as rows
+
+    keepCols         <- setdiff(colnames(MEs.template), "MEgrey")
+    MEs.template.nog <- MEs.template[, keepCols, drop = FALSE]
+
+    kmeTab <- WGCNA::signedKME(t(cleanDat.template), MEs.template.nog, corFnc = "bicor")
+    kMEmat <- as.matrix(kmeTab)
+    colnames(kMEmat) <- stripME(colnames(kMEmat))               # -> bare colors
+    rownames(kMEmat) <- rownames(cleanDat.template)
+
+    featureNames    <- rownames(cleanDat.template)
+    netColors       <- as.character(netColors.template)
+    colorlist       <- setdiff(unique(netColors), "grey")
+    templateMEnames <- keepCols                                 # orderMEs() order
+    templateDim     <- dim(MEs.template.nog)
+  }
+
+  ## ===========================================================================
+  ## Rank members within each module, intersect with the target feature space
+  ## ===========================================================================
+  thismod <- thismodTop <- overlap <- list()
 
   for (eachColor in colorlist) {
-    idx <- which(netColors.template == eachColor)
-    # data.frame of (Symbol, kME) sorted by kME desc
-    kmeCol <- paste0("kME", eachColor)
+
+    if (!eachColor %in% colnames(kMEmat)) {
+      warning("No kME column found for module '", eachColor, "'; module skipped.")
+      next
+    }
+
+    idx <- which(netColors == eachColor)
+    if (length(idx) == 0L) next
+
     df <- data.frame(
-      Symbols = rownames(cleanDat.template)[idx],
-      kME     = kMEdat[idx, kmeCol],
+      Symbols   = featureNames[idx],
+      kME       = as.numeric(kMEmat[idx, eachColor]),
+      stringsAsFactors = FALSE,
       row.names = NULL
     )
-    df <- df[order(df$kME, decreasing = TRUE), ]
+    df <- df[!is.na(df$kME), , drop = FALSE]
+    if (nrow(df) == 0L) next
+    df <- df[order(df$kME, decreasing = TRUE), , drop = FALSE]
     thismod[[eachColor]] <- df
 
-    # take top topPercent (at least 1 row if any exist)
-    topN <- max(1, round(nrow(df) * topPercent, 0))
-    topDF <- df[seq_len(topN), , drop = FALSE]
-
-    # primary overlap
+    ## take top topPercent (at least 1 row)
+    topN     <- min(nrow(df), max(1, round(nrow(df) * topPercent, 0)))
+    topDF    <- df[seq_len(topN), , drop = FALSE]
     overlap1 <- intersect(targetSymbols, topDF$Symbols)
 
-    # if not enough, attempt "rescue" using kME threshold
+    ## if not enough, extend down to the kME rescue threshold
     if (length(overlap1) < minimumMEmembers) {
-      below <- which(df$kME < minKmeThreshToRescue)
-      if (length(below) > 0) {
-        take <- seq_len(max(1, below[1] - 1))
-      } else {
-        take <- seq_len(nrow(df))  # no entries below threshold -> take all
-      }
-      topDF <- df[take, , drop = FALSE]
+      nAbove   <- sum(df$kME >= minKmeThreshToRescue)
+      take     <- seq_len(min(nrow(df), max(topN, nAbove)))
+      topDF    <- df[take, , drop = FALSE]
       overlap1 <- intersect(targetSymbols, topDF$Symbols)
     }
 
-    # keep only if we meet the minimum members criterion
     if (length(overlap1) >= minimumMEmembers) {
-      overlap[[eachColor]]   <- overlap1
+      overlap[[eachColor]]    <- overlap1
       thismodTop[[eachColor]] <- topDF
-    } else {
-      overlap[[eachColor]] <- NULL
-      thismodTop[[eachColor]] <- NULL
     }
   }
 
-  # Remove modules with no overlap
-  overlap <- overlap[!vapply(overlap, is.null, logical(1))]
-  if (length(overlap) == 0) {
+  ## --- nothing usable ---------------------------------------------------------
+  if (length(overlap) == 0L) {
     warning("No modules met the overlap criteria in the target cohort; returning empty MEsSynth.")
-    # Still create a zero-column data.frame with rownames as target samples
     MEsSynth <- data.frame(row.names = colnames(cleanDat.target))
-    # Print the requested dimension info
     message("dim(MEsSynth): ", paste(dim(MEsSynth), collapse = " x "))
-    message("dim(MEs)     : ", paste(dim(MEs.template.nog), collapse = " x "))
+    if (useKME) {
+      message("template modules (from kMEdat): ", length(templateMEnames))
+    } else {
+      message("dim(MEs)     : ", paste(templateDim, collapse = " x "))
+    }
     message("No modules generated syntheticMEs.")
-    # Write an empty CSV with proper header
     utils::write.csv(data.frame(), file = matchCSV, row.names = FALSE)
     return(MEsSynth)
   }
 
-  # --- Assemble marker expression matrix and parallel color vector ------------
+  ## --- marker expression matrix and parallel color vector ---------------------
   cleanDatMarkers <- matrix(nrow = 0, ncol = ncol(cleanDat.target))
   colnames(cleanDatMarkers) <- colnames(cleanDat.target)
   markerColors <- character(0)
 
   for (mod in names(overlap)) {
-    rowsToBind <- cleanDat.target[match(overlap[[mod]], targetSymbols), , drop = FALSE]
+    rowsToBind      <- cleanDat.target[match(overlap[[mod]], targetSymbols), , drop = FALSE]
     cleanDatMarkers <- rbind(cleanDatMarkers, rowsToBind)
     markerColors    <- c(markerColors, rep(mod, nrow(rowsToBind)))
   }
 
-  # --- Synthetic MEs in the target cohort ------------------------------------
+  ## --- synthetic MEs in the target cohort ------------------------------------
   MEsSynth <- WGCNA::moduleEigengenes(t(cleanDatMarkers), markerColors, impute = FALSE)$eigengenes
   rownames(MEsSynth) <- colnames(cleanDat.target)
 
-  # Keep only columns that exist in the template ME set (sans grey), in the same order
-  keepOrder <- intersect(colnames(MEs.template.nog), colnames(MEsSynth))
+  ## keep template modules only, in template order
+  keepOrder <- intersect(templateMEnames, colnames(MEsSynth))
   MEsSynth  <- MEsSynth[, keepOrder, drop = FALSE]
 
-  # --- Console outputs as requested ------------------------------------------
+  ## --- console output ---------------------------------------------------------
   message("dim(MEsSynth): ", paste(dim(MEsSynth), collapse = " x "))
-  message("dim(MEs)     : ", paste(dim(MEs.template.nog), collapse = " x "))
+  if (useKME) {
+    message("template modules (from kMEdat): ", length(templateMEnames))
+  } else {
+    message("dim(MEs)     : ", paste(templateDim, collapse = " x "))
+  }
 
-  if (ncol(MEsSynth) < ncol(MEs.template.nog)) {
-    message("Synthetic MEs missing for ", ncol(MEs.template.nog) - ncol(MEsSynth),
-            " template module(s).")
+  if (ncol(MEsSynth) < length(templateMEnames)) {
+    missingMods <- setdiff(templateMEnames, colnames(MEsSynth))
+    message("Synthetic MEs missing for ", length(missingMods), " template module(s): ",
+            paste(missingMods, collapse = ", "))
   } else {
     message("All modules generated syntheticMEs.")
   }
 
-  # --- Write CSV of exact-match members used per module -----------------------
-  # Create a padded data.frame so all columns have equal length
-  maxLen <- max(vapply(overlap, length, integer(1)))
-  padCol <- function(x, n) { c(x, rep(NA_character_, n - length(x))) }
+  ## --- CSV of exact-match members used per module -----------------------------
+  maxLen   <- max(vapply(overlap, length, integer(1)))
+  padCol   <- function(x, n) c(x, rep(NA_character_, n - length(x)))
   memberDF <- stats::setNames(
     data.frame(lapply(overlap, padCol, n = maxLen), check.names = FALSE),
     names(overlap)
   )
   utils::write.csv(memberDF, file = matchCSV, row.names = FALSE)
+
+  ## --- provenance -------------------------------------------------------------
+  attr(MEsSynth, "members")        <- overlap
+  attr(MEsSynth, "netColors.used") <- stats::setNames(netColors, featureNames)
 
   return(MEsSynth)
 }
